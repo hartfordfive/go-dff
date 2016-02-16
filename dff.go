@@ -6,7 +6,6 @@ import (
 	//"encoding/hex"
 	"flag"
 	"fmt"
-	//"github.com/boltdb/bolt"
 	//"io"
 	//"log"
 	"os"
@@ -33,10 +32,6 @@ const (
 var maxHashBytes int
 var fastFingerprint int
 var debug int8
-
-//var dbConn *db.DB
-
-//var collection_files *db.Col
 
 var dupFileList chan File
 var filesToProcess chan File
@@ -163,6 +158,10 @@ func main() {
 		panic(err)
 	}
 
+	if err := dbConn.Create("DuplicateFiles"); err != nil {
+		panic(err)
+	}
+
 	// Create indices
 	col_files := dbConn.Use("Files")
 	_ = col_files.Index([]string{"Path", "Hash", "Duplicates"})
@@ -171,6 +170,10 @@ func main() {
 	_ = col_files.Index([]string{"Path"})
 	_ = col_files.Index([]string{"Hash"})
 	_ = col_files.Index([]string{"Duplicates"})
+
+	col_dupfiles := dbConn.Use("DuplicateFiles")
+	_ = col_dupfiles.Index([]string{"Path", "Original"})
+	_ = col_dupfiles.Index([]string{"Original"})
 
 	// Start another goroutine to generate the hashes of the files and place
 	// them on another channel
@@ -196,7 +199,6 @@ func processFiles(wg *sync.WaitGroup, filesToProcess chan File, dupFileList chan
 
 	for f := range filesToProcess {
 
-		//fmt.Println("\tProcessing:", f)
 		// If the file is greater than 1MB, use the fast-finger print approach
 		if f.Size > fsizeSmallThreshold && fastFingerprint == 1 {
 			f.FastFingerprint = true
@@ -229,8 +231,7 @@ func processFiles(wg *sync.WaitGroup, filesToProcess chan File, dupFileList chan
 
 			// -------- 1. Find the original file with the given hash ----------
 			var query interface{}
-			json_query := "{\"eq\": \"" + f.Hash + "\", \"in\": [\"Hash\"], \"limit\": 10}"
-			// []byte(`[{"eq": "[HASH]", "in": ["Hash"]}]`)
+			json_query := "{\"eq\": \"" + f.Hash + "\", \"in\": [\"Hash\"], \"limit\": 100}"
 
 			json.Unmarshal([]byte(json_query), &query)
 			queryResult := make(map[int]struct{}) // query result (document IDs) goes into map keys
@@ -254,29 +255,33 @@ func processFiles(wg *sync.WaitGroup, filesToProcess chan File, dupFileList chan
 				if _, ok := readBack["Duplicates"]; ok {
 					fmt.Println("\t*** Updating duplicate copies")
 					// Other previously found duplicates, so add this one to the list
+
+					// Now add all the previous duplicates to the updatd list
 					duplicates = []string{f.Path}
-
 					curr_duplicates := reflect.ValueOf(readBack["Duplicates"])
-
 					for i := 0; i < curr_duplicates.Len(); i++ {
-						// Now add all the previous duplicates to the updatd list
 						duplicates = append(duplicates, fmt.Sprintf("%v", curr_duplicates.Index(i)))
 					}
 					// Finally update the record
 					fmt.Println("\t*** Updated duplicates:", duplicates)
-					// reflect.ValueOf(t).Index(0)
 
-					err = col_files.Update(id, map[string]interface{}{
-						"Path":            readBack["Path"],
-						"Size":            readBack["Size"],
-						"Hash":            readBack["Hash"],
-						"FastFingerprint": readBack["FastFingerprint"],
-						"Duplicates":      duplicates,
-					})
-					if err != nil {
-						fmt.Println("Could not update original file record:")
-						panic(err)
-					}
+					_, err = col_dupfiles.Insert(map[string]interface{}{
+						"Path":     f.Path,
+						"Original": readBack["Path"]})
+
+					/*
+						err = col_files.Update(id, map[string]interface{}{
+							"Path":            readBack["Path"],
+							"Size":            readBack["Size"],
+							"Hash":            readBack["Hash"],
+							"FastFingerprint": readBack["FastFingerprint"],
+							"Duplicates":      duplicates,
+						})
+						if err != nil {
+							fmt.Println("Could not update original file record:")
+							panic(err)
+						}
+					*/
 				} else {
 					// ---------- 3. BF returned false positive, so just add the duplicate --------
 					fmt.Println("\t*** No current duplicate copies.  Adding the first.")
@@ -297,29 +302,44 @@ func processFiles(wg *sync.WaitGroup, filesToProcess chan File, dupFileList chan
 	}
 
 	// ----------- The end of this function is to get the data in the DB for testing
-	var query interface{}
-	fmt.Println("\n----------------- TEST DATA -----------------")
-	json.Unmarshal([]byte(`{"has": ["Duplicates"], "limit": 100}`), &query)
+	/*
+		var query interface{}
+		fmt.Println("\n----------------- TEST DATA -----------------")
+		json.Unmarshal([]byte(`{"has": ["Duplicates"], "limit": 100}`), &query)
 
-	queryResult := make(map[int]struct{}) // query result (document IDs) goes into map keys
+		queryResult := make(map[int]struct{}) // query result (document IDs) goes into map keys
 
-	if err := db.EvalQuery(query, col_files, &queryResult); err != nil {
-		panic(err)
-	}
-
-	// Query result are document IDs
-	for id := range queryResult {
-		// To get query result document, simply read it
-		readBack, err := col_files.Read(id)
-		if err != nil {
+		if err := db.EvalQuery(query, col_files, &queryResult); err != nil {
 			panic(err)
 		}
-		fmt.Printf("Query returned document %v\n", readBack)
-		fmt.Println("-------------------")
 
-	}
+		// Query result are document IDs
+		for id := range queryResult {
+			// To get query result document, simply read it
+			readBack, err := col_files.Read(id)
+			if err != nil {
+				panic(err)
+			}
+
+
+			fmt.Println("First Occurence:", readBack["Path"])
+			fmt.Println("Duplicates:")
+			dups := reflect.ValueOf(readBack["Duplicates"])
+			for i := 0; i < dups.Len(); i++ {
+				fmt.Printf("\t-> %v\n", dups.Index(i))
+			}
+			fmt.Println("-------------------\n")
+
+		}
+	*/
 
 	wg.Done()
 	//return
+
+	fmt.Println("Printing all documents")
+	col_files.ForEachDoc(func(id int, docContent []byte) (willMoveOn bool) {
+		fmt.Println("Document", id, "is", string(docContent))
+		return true // move on to the next document OR
+	})
 
 }

@@ -1,0 +1,2 @@
+# DFF - Duplicate File Finder
+

@@ -2,25 +2,18 @@ package main
 
 import (
 	//"bufio"
-	//"crypto/sha1"
-	//"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
-	//"io"
-	//"log"
+	"github.com/HouzuoGuo/tiedot/db"
+	_ "github.com/HouzuoGuo/tiedot/dberr"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
-	//"strings"
-	"encoding/json"
-	"github.com/HouzuoGuo/tiedot/db"
-	_ "github.com/HouzuoGuo/tiedot/dberr"
 	"sync"
 	//"time"
-	//"github.com/steakknife/bloomfilter"
 	"github.com/turgon/bloom"
-	"reflect"
 )
 
 const (
@@ -63,7 +56,7 @@ func main() {
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	debug = 1
+	debug = 0
 
 	// First, scan all the files and add them to their designated list
 	var fileDir, outFile string
@@ -149,6 +142,7 @@ func main() {
 
 	// (Create if not exist) open a database
 	dbConn, err := db.OpenDB(fileDB)
+	defer dbConn.Close()
 	if err != nil {
 		panic(err)
 	}
@@ -164,16 +158,14 @@ func main() {
 
 	// Create indices
 	col_files := dbConn.Use("Files")
-	_ = col_files.Index([]string{"Path", "Hash", "Duplicates"})
 	_ = col_files.Index([]string{"Path", "Hash"})
-	_ = col_files.Index([]string{"Hash", "Duplicates"})
-	_ = col_files.Index([]string{"Path"})
 	_ = col_files.Index([]string{"Hash"})
-	_ = col_files.Index([]string{"Duplicates"})
+	_ = col_files.Index([]string{"Path"})
 
 	col_dupfiles := dbConn.Use("DuplicateFiles")
-	_ = col_dupfiles.Index([]string{"Path", "Original"})
-	_ = col_dupfiles.Index([]string{"Original"})
+	_ = col_dupfiles.Index([]string{"OriginalFile", "DuplicateFile"})
+	_ = col_dupfiles.Index([]string{"OriginalFile"})
+	_ = col_dupfiles.Index([]string{"DuplicateFile"})
 
 	// Start another goroutine to generate the hashes of the files and place
 	// them on another channel
@@ -188,14 +180,55 @@ func main() {
 	// Once all the file hashes are generated, go over the list of  files/hashes and build
 	// the duplicate list
 
+	fmt.Println("Printing all documents")
+	col_files.ForEachDoc(func(id int, docContent []byte) (willMoveOn bool) {
+
+		//fmt.Println("Document", id, "is", string(docContent))
+		var originalDoc map[string]interface{}
+		json.Unmarshal(docContent, &originalDoc)
+
+		fmt.Println("Original File: ", originalDoc["Path"].(string))
+		// ---------------- GET THE ORIGINAL AND ALL DUPLICATES -------------
+
+		var query interface{}
+		json_query := "{\"eq\": \"" + originalDoc["Path"].(string) + "\", \"in\": [\"OriginalFile\"], \"limit\": 1000}"
+
+		json.Unmarshal([]byte(json_query), &query)
+		queryResult := make(map[int]struct{}) // query result (document IDs) goes into map keys
+
+		if err := db.EvalQuery(query, col_dupfiles, &queryResult); err != nil {
+			panic(err)
+		}
+
+		for id := range queryResult {
+
+			readBack, err := col_dupfiles.Read(id)
+			if err != nil {
+				panic(err)
+			}
+
+			fmt.Println("\t -> ", readBack["DuplicateFile"])
+
+		}
+
+		fmt.Println()
+
+		// ------------------------------------------------------------------
+
+		return true // move on to the next document OR
+	})
+
 }
 
 func processFiles(wg *sync.WaitGroup, filesToProcess chan File, dupFileList chan File, doneScanning chan bool, dbConn *db.DB) {
 
 	col_files := dbConn.Use("Files")
-	//col_dup_files := dbConn.Use("DuplicateFiles")
+	col_dupfiles := dbConn.Use("DuplicateFiles")
 
-	fmt.Println("Current files to process:", len(filesToProcess))
+	fmt.Println("Total files to process:", len(filesToProcess))
+
+	// No need for mutex as only one goroutine is processing from the channel
+	//var mutex = &sync.Mutex{}
 
 	for f := range filesToProcess {
 
@@ -212,7 +245,7 @@ func processFiles(wg *sync.WaitGroup, filesToProcess chan File, dupFileList chan
 		}
 		f.Hash = md5h
 
-		// time.Now().Format(time.RFC3339) // Date added
+		//mutex.Lock()
 
 		// If the hash isn't already in the bloom filter, then add it
 		if !bf.Test([]byte(f.Hash)) { // probably true, could be false
@@ -227,11 +260,14 @@ func processFiles(wg *sync.WaitGroup, filesToProcess chan File, dupFileList chan
 
 		} else { // Else a duplicate has hit
 
-			fmt.Println("File already in bloom filter!")
+			if debug >= 1 {
+				fmt.Println(f.Path)
+				fmt.Println("\t-> File already in bloom filter!")
+			}
 
 			// -------- 1. Find the original file with the given hash ----------
 			var query interface{}
-			json_query := "{\"eq\": \"" + f.Hash + "\", \"in\": [\"Hash\"], \"limit\": 100}"
+			json_query := "{\"eq\": \"" + f.Hash + "\", \"in\": [\"Hash\"], \"limit\": 1}"
 
 			json.Unmarshal([]byte(json_query), &query)
 			queryResult := make(map[int]struct{}) // query result (document IDs) goes into map keys
@@ -240,7 +276,6 @@ func processFiles(wg *sync.WaitGroup, filesToProcess chan File, dupFileList chan
 				panic(err)
 			}
 
-			var duplicates []string
 			for id := range queryResult {
 
 				readBack, err := col_files.Read(id)
@@ -249,97 +284,49 @@ func processFiles(wg *sync.WaitGroup, filesToProcess chan File, dupFileList chan
 				}
 
 				fmt.Printf("Found original record: %v\n", readBack)
-				fmt.Println("\tDuplicates?:", readBack["Duplicates"])
-				fmt.Println("")
 
-				if _, ok := readBack["Duplicates"]; ok {
-					fmt.Println("\t*** Updating duplicate copies")
-					// Other previously found duplicates, so add this one to the list
+				id, err = col_dupfiles.Insert(map[string]interface{}{
+					"DuplicateFile": f.Path,
+					"OriginalFile":  readBack["Path"]})
 
-					// Now add all the previous duplicates to the updatd list
-					duplicates = []string{f.Path}
-					curr_duplicates := reflect.ValueOf(readBack["Duplicates"])
-					for i := 0; i < curr_duplicates.Len(); i++ {
-						duplicates = append(duplicates, fmt.Sprintf("%v", curr_duplicates.Index(i)))
-					}
-					// Finally update the record
-					fmt.Println("\t*** Updated duplicates:", duplicates)
-
-					_, err = col_dupfiles.Insert(map[string]interface{}{
-						"Path":     f.Path,
-						"Original": readBack["Path"]})
-
-					/*
-						err = col_files.Update(id, map[string]interface{}{
-							"Path":            readBack["Path"],
-							"Size":            readBack["Size"],
-							"Hash":            readBack["Hash"],
-							"FastFingerprint": readBack["FastFingerprint"],
-							"Duplicates":      duplicates,
-						})
-						if err != nil {
-							fmt.Println("Could not update original file record:")
-							panic(err)
-						}
-					*/
-				} else {
-					// ---------- 3. BF returned false positive, so just add the duplicate --------
-					fmt.Println("\t*** No current duplicate copies.  Adding the first.")
-					_, err = col_files.Insert(map[string]interface{}{
-						"Path":            readBack["Path"],
-						"Size":            readBack["Size"],
-						"Hash":            readBack["Hash"],
-						"FastFingerprint": readBack["FastFingerprint"],
-						"Duplicates":      []string{f.Path}})
+				if debug >= 1 {
+					fmt.Printf("Added %v to DuplicateFiles collection\n", id)
+					fmt.Println("")
 				}
-
 			}
 
-			fmt.Println("---------------------")
-
 		}
+
+		//mutex.Unlock()
 
 	}
 
-	// ----------- The end of this function is to get the data in the DB for testing
-	/*
-		var query interface{}
-		fmt.Println("\n----------------- TEST DATA -----------------")
-		json.Unmarshal([]byte(`{"has": ["Duplicates"], "limit": 100}`), &query)
-
-		queryResult := make(map[int]struct{}) // query result (document IDs) goes into map keys
-
-		if err := db.EvalQuery(query, col_files, &queryResult); err != nil {
-			panic(err)
-		}
-
-		// Query result are document IDs
-		for id := range queryResult {
-			// To get query result document, simply read it
-			readBack, err := col_files.Read(id)
-			if err != nil {
-				panic(err)
-			}
-
-
-			fmt.Println("First Occurence:", readBack["Path"])
-			fmt.Println("Duplicates:")
-			dups := reflect.ValueOf(readBack["Duplicates"])
-			for i := 0; i < dups.Len(); i++ {
-				fmt.Printf("\t-> %v\n", dups.Index(i))
-			}
-			fmt.Println("-------------------\n")
-
-		}
-	*/
-
 	wg.Done()
-	//return
 
-	fmt.Println("Printing all documents")
+}
+
+/*
+func writeReport(dbConn *db.DB, filename string) {
+
+	col_dupfiles := dbConn.Use("DuplicateFiles")
+	col_files := dbConn.Use("Files")
+
+	f, _ := os.Create(filename)
+	defer f.Close()
+	w := bufio.NewWriter(f)
+
+	// Now buffer all the data to the bufio writer
+
 	col_files.ForEachDoc(func(id int, docContent []byte) (willMoveOn bool) {
-		fmt.Println("Document", id, "is", string(docContent))
+		//fmt.Println("Document", id, "is", string(docContent))
+		_, _ = w.WriteString(fmt.Sprintf("Hash: %s\n\toriginal: %s\n\tdup: %s\n\n", k, v, dupFileListSmall[k]))
 		return true // move on to the next document OR
 	})
 
+	// Flush the buffer to the file
+	w.Flush()
+
+	fmt.Printf("|%20s|%20s|\n", "Report File ", outFile)
+	fmt.Println("\n")
 }
+*/

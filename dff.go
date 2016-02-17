@@ -187,7 +187,6 @@ func main() {
 		var originalDoc map[string]interface{}
 		json.Unmarshal(docContent, &originalDoc)
 
-		fmt.Println("Original File: ", originalDoc["Path"].(string))
 		// ---------------- GET THE ORIGINAL AND ALL DUPLICATES -------------
 
 		var query interface{}
@@ -200,6 +199,10 @@ func main() {
 			panic(err)
 		}
 
+		if len(queryResult) >= 1 {
+			fmt.Println("Original File: ", originalDoc["Path"].(string))
+		}
+
 		for id := range queryResult {
 
 			readBack, err := col_dupfiles.Read(id)
@@ -210,8 +213,6 @@ func main() {
 			fmt.Println("\t -> ", readBack["DuplicateFile"])
 
 		}
-
-		fmt.Println()
 
 		// ------------------------------------------------------------------
 
